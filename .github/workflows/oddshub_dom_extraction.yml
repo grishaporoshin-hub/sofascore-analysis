@@ -1,0 +1,97 @@
+name: OddsHub DOM match extraction
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        run: |
+          python -m pip install playwright beautifulsoup4
+          python -m playwright install chromium
+      - name: Extract visible match rows and dates
+        run: |
+          mkdir -p output
+          cat > /tmp/oddshub_extract_rows.py <<'PYCODE'
+          import asyncio, csv, json, re, traceback
+          from pathlib import Path
+          from bs4 import BeautifulSoup
+          from playwright.async_api import async_playwright
+
+          OUT = Path('output')
+          URL = 'https://www.oddshub.io/table-tennis/russia-liga-pro/results'
+          DATE_RE = re.compile(r'^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}$')
+          SCORE_RE = re.compile(r'^\d{1,2}-\d{1,2}$')
+          async def main():
+              report = {'requested_date':'2026-11-07','status':'started'}
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch()
+                  page = await browser.new_page(timezone_id='Europe/Moscow',locale='en-US',viewport={'width':1440,'height':900})
+                  try:
+                      r = await page.goto(URL,wait_until='domcontentloaded',timeout=60000)
+                      report['http'] = r.status if r else None
+                      await page.wait_for_timeout(2000)
+                      await page.get_by_role('button',name='Custom range').click(timeout=15000)
+                      await page.wait_for_timeout(400)
+                      target = page.get_by_role('button',name=re.compile(r'November 7th, 2026'))
+                      for i in range(14):
+                          if await target.count(): break
+                          await page.get_by_role('button',name='Go to the Previous Month').click(timeout=8000)
+                          await page.wait_for_timeout(180)
+                      if not await target.count(): raise RuntimeError('November 7 not found in calendar')
+                      await target.first.click()
+                      apply = page.get_by_role('button',name='Apply')
+                      if not await apply.is_enabled():
+                          await page.get_by_role('button',name=re.compile(r'November 8th, 2026')).first.click()
+                          report['selected_range']='Nov 7-8'
+                      else: report['selected_range']='Nov 7'
+                      await apply.click(timeout=12000)
+                      await page.wait_for_timeout(3000)
+                      report['url_after_apply']=page.url
+                      html=await page.content()
+                      (OUT/'page.html').write_text(html,encoding='utf-8')
+                      await page.screenshot(path=str(OUT/'page.png'),full_page=True)
+                      soup=BeautifulSoup(html,'html.parser')
+                      rows=[]; current_date=None; headings=[]
+                      for element in soup.select('h2, button[aria-label]'):
+                          if element.name=='h2':
+                              value=element.get_text(' ',strip=True)
+                              if DATE_RE.fullmatch(value):
+                                  current_date=value;headings.append(value)
+                          elif 'Closing odds.' in (element.get('aria-label') or ''):
+                              row=element.parent
+                              time=row.select_one('span') if row else None
+                              spans=element.select('span')
+                              scores=[v.get_text(' ',strip=True) for v in spans if SCORE_RE.fullmatch(v.get_text(' ',strip=True))]
+                              names=[v.get_text(' ',strip=True) for v in spans if 'font-medium' in ' '.join(v.get('class',[]))]
+                              tm=time.get_text(' ',strip=True) if time else ''
+                              if not re.fullmatch(r'\d{1,2}:\d{2}',tm): tm=''
+                              rows.append({'displayed_date':current_date or '', 'displayed_time':tm,
+                                  'player1':names[0] if len(names)>0 else '', 'player2':names[1] if len(names)>1 else '',
+                                  'set_scores':'|'.join(scores), 'set_count':len(scores),
+                                  'first_three_parity':('odd_present' if any((sum(map(int,v.split('-')))%2) for v in scores[:3]) else 'all_even') if len(scores)>=3 else 'incomplete',
+                                  'aria_label':element.get('aria-label','')})
+                      with (OUT/'matches_visible.csv').open('w',newline='',encoding='utf-8-sig') as f:
+                          w=csv.DictWriter(f,fieldnames=['displayed_date','displayed_time','player1','player2','set_scores','set_count','first_three_parity','aria_label']);w.writeheader();w.writerows(rows)
+                      report.update(status='extracted',displayed_date_headings=headings,rows=len(rows),complete_first_three=sum(x['set_count']>=3 for x in rows),sample_rows=rows[:5],warning='Displayed dates/times not independently verified; do not use as final year statistics')
+                  except Exception as e:
+                      report.update(status='error',error=repr(e),traceback=traceback.format_exc()[-4000:])
+                      try: await page.screenshot(path=str(OUT/'error.png'))
+                      except Exception: pass
+                  finally:
+                      (OUT/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+                      print(json.dumps(report,ensure_ascii=False,indent=2))
+                      await browser.close()
+          asyncio.run(main())
+          PYCODE
+          python /tmp/oddshub_extract_rows.py
+      - name: Upload results (even if extraction fails)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oddshub-dom-diagnostics
+          path: output/
+          retention-days: 7
