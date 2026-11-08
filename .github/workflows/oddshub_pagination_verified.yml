@@ -1,0 +1,148 @@
+name: OddsHub pagination and date validation
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install browser and parser
+        run: |
+          python -m pip install playwright beautifulsoup4
+          python -m playwright install chromium
+      - name: Load all visible results and audit dates
+        run: |
+          mkdir -p output
+          cat > /tmp/oddshub_pagination_audit.py <<'PYCODE'
+          import asyncio, csv, json, re, traceback
+          from collections import Counter
+          from datetime import datetime
+          from pathlib import Path
+          from bs4 import BeautifulSoup
+          from playwright.async_api import async_playwright
+
+          OUT=Path('output')
+          URL='https://www.oddshub.io/table-tennis/russia-liga-pro/results'
+          DAY=re.compile(r'^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}$')
+          SCORE=re.compile(r'^\d{1,2}-\d{1,2}$')
+          TIME=re.compile(r'^\d{1,2}:\d{2}$')
+          MORE=re.compile(r'^Show\s+\d+\s+more$',re.I)
+          def extract(html):
+              soup=BeautifulSoup(html,'html.parser'); date=None; rows=[]; headings=[]
+              for el in soup.select('h2, button[aria-label]'):
+                  if el.name=='h2':
+                      t=el.get_text(' ',strip=True)
+                      if DAY.fullmatch(t): date=t; headings.append(t)
+                  elif 'Closing odds.' in (el.get('aria-label') or ''):
+                      parent=el.parent
+                      first=parent.select_one('span') if parent else None
+                      tm=first.get_text(' ',strip=True) if first else ''
+                      if not TIME.fullmatch(tm): tm=''
+                      spans=el.select('span')
+                      scores=[v.get_text(' ',strip=True) for v in spans if SCORE.fullmatch(v.get_text(' ',strip=True))]
+                      names=[v.get_text(' ',strip=True) for v in spans if 'font-medium' in (v.get('class') or [])]
+                      rows.append({'displayed_date':date or '', 'displayed_time':tm,
+                        'player1':names[0] if len(names)>0 else '', 'player2':names[1] if len(names)>1 else '',
+                        'set_scores':'|'.join(scores),'set_count':len(scores),'aria_label':el.get('aria-label','')})
+              return rows,headings
+          async def main():
+              report={'requested_date':'2026-11-07','status':'started','timezone_setting':'Europe/Moscow', 'pagination':[]}
+              async with async_playwright() as p:
+                  browser=await p.chromium.launch()
+                  page=await browser.new_page(timezone_id='Europe/Moscow',locale='en-US',viewport={'width':1440,'height':900})
+                  try:
+                      response=await page.goto(URL,wait_until='domcontentloaded',timeout=60000)
+                      report['http']=response.status if response else None
+                      await page.wait_for_timeout(1800)
+                      await page.get_by_role('button',name='Custom range').click(timeout=15000)
+                      target=page.get_by_role('button',name=re.compile(r'November 7th, 2026'))
+                      for i in range(14):
+                          if await target.count(): break
+                          await page.get_by_role('button',name='Go to the Previous Month').click(timeout=8000)
+                          await page.wait_for_timeout(150)
+                      if not await target.count(): raise RuntimeError('November 7 not present in calendar')
+                      await target.first.click()
+                      apply=page.get_by_role('button',name='Apply')
+                      if not await apply.is_enabled():
+                          raise RuntimeError('Single-day selection not accepted: no fallback range chosen')
+                      await apply.click(timeout=12000)
+                      await page.wait_for_timeout(1800)
+                      report['url_after_apply']=page.url
+                      if 'from=2026-11-07' not in page.url or 'to=2026-11-07' not in page.url:
+                          raise RuntimeError('Selected URL does not match requested date')
+                      for n in range(100):
+                          html=await page.content(); rows,headings=extract(html)
+                          buttons=page.get_by_role('button',name=MORE)
+                          count=await buttons.count()
+                          labels=await buttons.all_text_contents() if count else []
+                          report['pagination'].append({'step':n,'visible_rows':len(rows),'load_buttons':labels[:4]})
+                          print('PAGE',n,'ROWS',len(rows),'MORE',labels[:4],flush=True)
+                          if not count: break
+                          before=len(rows)
+                          try:
+                              await buttons.first.click(timeout=10000)
+                              await page.wait_for_timeout(900)
+                              newrows,_=extract(await page.content())
+                              if len(newrows)<=before:
+                                  await page.wait_for_timeout(2500)
+                                  newrows,_=extract(await page.content())
+                              if len(newrows)<=before:
+                                  report['pagination_warning']='Load more did not increase rows; completeness unconfirmed'
+                                  break
+                          except Exception as e:
+                              report['pagination_warning']='Pagination error: '+repr(e)
+                              break
+                      else:
+                          report['pagination_warning']='100 pagination iterations reached; completeness unconfirmed'
+                      html=await page.content()
+                      (OUT/'final_page.html').write_text(html,encoding='utf-8')
+                      await page.screenshot(path=str(OUT/'final_page.png'),full_page=True)
+                      rows,headings=extract(html)
+                      seen=set(); unique=[]; duplicates=0
+                      for row in rows:
+                          key=tuple(row[k] for k in ['displayed_date','displayed_time','player1','player2','set_scores','aria_label'])
+                          if key in seen: duplicates+=1;continue
+                          seen.add(key);unique.append(row)
+                      for row in unique:
+                          row['date_2026']=''
+                          try:
+                              row['date_2026']=datetime.strptime(row['displayed_date']+' 2026','%A, %b %d %Y').strftime('%Y-%m-%d')
+                          except ValueError: pass
+                          ss=row['set_scores'].split('|') if row['set_scores'] else []
+                          row['first_three_parity']='incomplete'
+                          if len(ss)>=3:
+                              row['first_three_parity']='odd_present' if any(sum(map(int,s.split('-')))%2 for s in ss[:3]) else 'all_even'
+                          row['in_target_window']='yes' if row['date_2026']=='2026-11-07' and row['displayed_time'] and '07:00'<=row['displayed_time']<'11:00' else 'no'
+                      cols=['date_2026','displayed_date','displayed_time','player1','player2','set_scores','set_count','first_three_parity','in_target_window','aria_label']
+                      with (OUT/'all_visible_matches.csv').open('w',newline='',encoding='utf-8-sig') as f:
+                          w=csv.DictWriter(f,fieldnames=cols);w.writeheader();w.writerows(unique)
+                      target_rows=[r for r in unique if r['in_target_window']=='yes' and r['first_three_parity']!='incomplete']
+                      with (OUT/'target_07_11.csv').open('w',newline='',encoding='utf-8-sig') as f:
+                          w=csv.DictWriter(f,fieldnames=cols);w.writeheader();w.writerows(target_rows)
+                      report.update(status='extracted',rows_before_dedup=len(rows),exact_duplicate_rows=duplicates,
+                        unique_rows=len(unique),headings=headings,dates=dict(Counter(r['date_2026'] for r in unique)),
+                        target_07_11_count=len(target_rows),target_odd=sum(r['first_three_parity']=='odd_present' for r in target_rows),
+                        target_all_even=sum(r['first_three_parity']=='all_even' for r in target_rows),
+                        incomplete_sets=sum(r['first_three_parity']=='incomplete' for r in unique),
+                        caveat='Display timezone not independently verified against per-match timestamps. Same-player/same-time repeats may be distinct matches; no canonical IDs. A complete year cannot be inferred from this test.')
+                  except Exception as e:
+                      report.update(status='error',error=repr(e),traceback=traceback.format_exc()[-5000:])
+                      try: await page.screenshot(path=str(OUT/'error.png'),full_page=True)
+                      except Exception: pass
+                  finally:
+                      (OUT/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+                      print(json.dumps(report,ensure_ascii=False,indent=2),flush=True)
+                      await browser.close()
+          asyncio.run(main())
+          PYCODE
+          python /tmp/oddshub_pagination_audit.py
+      - name: Upload diagnostic archive even on errors
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oddshub-pagination-audit
+          path: output/
+          if-no-files-found: warn
+          retention-days: 7
