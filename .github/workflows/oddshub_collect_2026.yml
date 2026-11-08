@@ -1,0 +1,137 @@
+name: Collect OddsHub 2026 results
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Install browser and parser
+        run: |
+          python -m pip install --quiet playwright beautifulsoup4
+          python -m playwright install --with-deps chromium
+      - name: Collect September October November 2026
+        run: |
+          mkdir -p output
+          cat > /tmp/collect.py <<'PY'
+          import asyncio, csv, json, re, calendar
+          from datetime import date, datetime
+          from pathlib import Path
+          from bs4 import BeautifulSoup
+          from playwright.async_api import async_playwright
+
+          BASE='https://www.oddshub.io/table-tennis/russia-liga-pro/results'
+          OUT=Path('output')
+          MONTHS=[9,10,11]
+          END=date(2026,11,8)
+          all_rows=[]; reports=[]
+
+          def parse(html, year, month):
+              soup=BeautifulSoup(html,'html.parser')
+              rows=[]
+              for section in soup.select('section'):
+                  heading=section.find(['h2','h3','h4'])
+                  if not heading: continue
+                  header=heading.get_text(' ',strip=True)
+                  md=re.search(r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{1,2})\b',header,re.I)
+                  if not md: continue
+                  month_num=datetime.strptime(md.group(1)[:3].title(),'%b').month
+                  day=int(md.group(2))
+                  if month_num!=month: continue
+                  d=date(year,month_num,day)
+                  for btn in section.select('button[aria-label*="Closing odds"]'):
+                      card=btn.parent
+                      time_node=card.select_one('span')
+                      if not time_node: continue
+                      tm=time_node.get_text(' ',strip=True)
+                      if not re.fullmatch(r'\d{1,2}:\d{2}',tm): continue
+                      score_spans=btn.select('span.mt-0\\.5 span')
+                      if not score_spans:
+                          score_spans=[x for x in btn.find_all('span') if re.fullmatch(r'\d+\s*-\s*\d+',x.get_text(' ',strip=True))]
+                      scores=[]
+                      for span in score_spans:
+                          match=re.fullmatch(r'(\d+)\s*-\s*(\d+)',span.get_text(' ',strip=True))
+                          if match: scores.append((int(match[1]),int(match[2])))
+                      if len(scores)<3: continue
+                      first=scores[:3]
+                      odd=any((a+b)%2 for a,b in first)
+                      rows.append({'date_msk':d.isoformat(),'time_msk':tm,'match':btn.get('aria-label',''),
+                                   'set1':f'{first[0][0]}:{first[0][1]}',
+                                   'set2':f'{first[1][0]}:{first[1][1]}',
+                                   'set3':f'{first[2][0]}:{first[2][1]}',
+                                   'category':'at_least_one_odd' if odd else 'all_even',
+                                   'source':'OddsHub'})
+              return rows
+
+          async def main():
+              async with async_playwright() as p:
+                  browser=await p.chromium.launch(headless=True)
+                  page=await browser.new_page(viewport={'width':1440,'height':900},timezone_id='Europe/Moscow')
+                  for month in MONTHS:
+                      last=min(calendar.monthrange(2026,month)[1], END.day if month==11 else 31)
+                      for start_day in (1, 29):
+                          if start_day>last: continue
+                          stop=min(last, start_day+27)
+                          begin=f'2026-{month:02d}-{start_day:02d}'
+                          finish=f'2026-{month:02d}-{stop:02d}'
+                          url=f'{BASE}?from={begin}&to={finish}'
+                          report={'from':begin,'to':finish,'url':url,'clicks':0,'truncated':False}
+                          try:
+                              response=await page.goto(url,wait_until='domcontentloaded',timeout=55000)
+                              await page.wait_for_timeout(1800)
+                              report['http']=response.status if response else None
+                              previous=0
+                              for n in range(35):
+                                  current=len(parse(await page.content(),2026,month))
+                                  button=page.get_by_role('button',name=re.compile('Show 100 more',re.I))
+                                  if not await button.count() or not await button.first.is_visible(): break
+                                  if current<=previous and n>0: break
+                                  previous=current
+                                  await button.first.click(timeout=10000)
+                                  report['clicks']+=1
+                                  await page.wait_for_timeout(1000)
+                              if await page.get_by_role('button',name=re.compile('Show 100 more',re.I)).count():
+                                  report['truncated']=True
+                              html=await page.content()
+                              parsed=parse(html,2026,month)
+                              report['parsed_rows']=len(parsed)
+                              report['no_matches']='No matches finished in this period' in await page.locator('body').inner_text()
+                              all_rows.extend(parsed)
+                              (OUT/f'page_{begin}_{finish}.html').write_text(html,encoding='utf-8')
+                          except Exception as exc:
+                              report['error']=str(exc)[:300]
+                          reports.append(report)
+                          print(json.dumps(report),flush=True)
+                  await browser.close()
+              unique={(r['date_msk'],r['time_msk'],r['match']):r for r in all_rows}
+              rows=sorted(unique.values(),key=lambda r:(r['date_msk'],r['time_msk'],r['match']))
+              fields=['date_msk','time_msk','match','set1','set2','set3','category','source']
+              with (OUT/'all_parsed_matches.csv').open('w',newline='',encoding='utf-8-sig') as f:
+                  writer=csv.DictWriter(f,fieldnames=fields);writer.writeheader();writer.writerows(rows)
+              selected=[r for r in rows if '07:00'<=r['time_msk']<='11:00' and r['date_msk']<=END.isoformat()]
+              with (OUT/'matches_07_11_msk.csv').open('w',newline='',encoding='utf-8-sig') as f:
+                  writer=csv.DictWriter(f,fieldnames=fields);writer.writeheader();writer.writerows(selected)
+              counts={}
+              for r in selected:
+                  d=r['date_msk'][:7]
+                  c=counts.setdefault(d,{'matches':0,'at_least_one_odd':0,'all_even':0})
+                  c['matches']+=1;c[r['category']]+=1
+              summary={'note':'Partial source coverage; no matches is not proof that no matches occurred. Check truncated and errors.',
+                       'period_reports':reports,'monthly_counts':counts,'total_matches':len(selected),
+                       'total_at_least_one_odd':sum(r['category']=='at_least_one_odd' for r in selected),
+                       'total_all_even':sum(r['category']=='all_even' for r in selected)}
+              (OUT/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+              print('TOTAL',json.dumps({k:v for k,v in summary.items() if k!='period_reports'},ensure_ascii=False),flush=True)
+          asyncio.run(main())
+          PY
+          python /tmp/collect.py
+      - name: Upload results and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oddshub-2026-sep-nov-results
+          path: output/
+          retention-days: 7
+          if-no-files-found: warn
