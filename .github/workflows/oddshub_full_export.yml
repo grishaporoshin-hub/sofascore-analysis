@@ -1,0 +1,70 @@
+name: Export OddsHub results
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install browser
+        run: |
+          python -m pip install --quiet playwright beautifulsoup4
+          python -m playwright install --with-deps chromium
+      - name: Load additional results and save data
+        run: |
+          mkdir -p output
+          cat > /tmp/export.py <<'PY'
+          import asyncio, re, json
+          from pathlib import Path
+          from bs4 import BeautifulSoup
+          from playwright.async_api import async_playwright
+
+          URL='https://www.oddshub.io/table-tennis/russia-liga-pro/results'
+          OUT=Path('output')
+          async def main():
+              async with async_playwright() as p:
+                  browser=await p.chromium.launch(headless=True)
+                  page=await browser.new_page(viewport={'width':1440,'height':900}, timezone_id='Europe/Moscow')
+                  response=await page.goto(URL,wait_until='domcontentloaded',timeout=60000)
+                  print('HTTP:', response.status if response else 'none',flush=True)
+                  await page.wait_for_timeout(2500)
+                  for n in range(1,11):
+                      button=page.get_by_role('button',name=re.compile('Show 100 more',re.I))
+                      if await button.count()==0 or not await button.first.is_visible():
+                          print('No more button at batch',n,flush=True)
+                          break
+                      before=await page.locator('body').inner_text()
+                      try:
+                          await button.first.click(timeout=10000)
+                          await page.wait_for_timeout(1800)
+                          after=await page.locator('body').inner_text()
+                          print('Batch',n,'chars',len(before),'->',len(after),flush=True)
+                          if len(after)<=len(before):
+                              print('No text growth, stopping',flush=True)
+                              break
+                      except Exception as e:
+                          print('Click failed:',str(e)[:250],flush=True)
+                          break
+                  html=await page.content()
+                  (OUT/'results_expanded.html').write_text(html,encoding='utf-8')
+                  soup=BeautifulSoup(html,'html.parser')
+                  text=soup.get_text(' ',strip=True)
+                  (OUT/'results_text.txt').write_text(text,encoding='utf-8')
+                  await page.screenshot(path=str(OUT/'page.png'),full_page=False)
+                  print('Final HTML bytes:',len(html.encode()),flush=True)
+                  print('November dates:',re.findall(r'(?:Saturday|Sunday|Monday|Tuesday|Wednesday|Thursday|Friday), Nov \d+',text)[:20],flush=True)
+                  print('Contains verification page:', 'KillBot user verification' in text,flush=True)
+                  await browser.close()
+          asyncio.run(main())
+          PY
+          python /tmp/export.py
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oddshub-expanded-results
+          path: output/
+          if-no-files-found: warn
+          retention-days: 7
