@@ -1,0 +1,105 @@
+name: OddsHub 2026 all available Liga Pro matches
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Install Playwright
+        run: |
+          python -m pip install playwright
+          python -m playwright install chromium
+      - name: Collect and analyze 2026
+        run: |
+          mkdir -p output
+          cat > /tmp/oddshub_full_year_runner.py <<'PYCODE'
+          import asyncio,csv,json,traceback
+          from collections import defaultdict
+          from datetime import date,datetime,timedelta,timezone
+          from pathlib import Path
+          from urllib.parse import urlencode
+          from zoneinfo import ZoneInfo
+          from playwright.async_api import async_playwright
+          OUT=Path('output'); OUT.mkdir(exist_ok=True)
+          START=date(2026,1,1); END=min(date.today(),date(2026,11,8))
+          MSK=ZoneInfo('Europe/Moscow')
+          fields=['id','date_utc','date_msk','time_msk','home','away','set1','set2','set3','odd_in_first_3','status']
+          records={}; days=[]; errors=[]
+          def csvout(name,rows,cols):
+           with (OUT/name).open('w',newline='',encoding='utf-8-sig') as f:
+            w=csv.DictWriter(f,fieldnames=cols,extrasaction='ignore');w.writeheader();w.writerows(rows)
+          async def collect():
+           async with async_playwright() as p:
+            browser=await p.chromium.launch()
+            page=await browser.new_page()
+            try:
+             await page.goto('https://www.oddshub.io/table-tennis/russia-liga-pro/results',wait_until='domcontentloaded',timeout=60000)
+             d=START
+             while d<=END:
+              a=datetime.combine(d,datetime.min.time(),tzinfo=MSK).astimezone(timezone.utc)
+              b=datetime.combine(d+timedelta(days=1),datetime.min.time(),tzinfo=MSK).astimezone(timezone.utc)-timedelta(seconds=1)
+              url='https://www.oddshub.io/api/historical/events/table-tennis/russia-liga-pro?'+urlencode({'from':a.strftime('%Y-%m-%dT%H:%M:%SZ'),'to':b.strftime('%Y-%m-%dT%H:%M:%SZ')})
+              info={'date':str(d),'api_success':False,'returned':None}
+              for attempt in range(3):
+               try:
+                resp=await page.request.get(url,timeout=30000)
+                if resp.status!=200:raise RuntimeError('HTTP '+str(resp.status))
+                data=await resp.json()
+                if not isinstance(data,list):raise ValueError('Unexpected API response type')
+                info['api_success']=True;info['returned']=len(data)
+                for e in data:
+                 if isinstance(e,dict) and e.get('id') is not None:records[str(e['id'])]=e
+                break
+               except Exception as exc:
+                info['error']=str(exc)
+                if attempt<2:await asyncio.sleep(1+attempt)
+              days.append(info)
+              if not info['api_success']:errors.append(info)
+              print(str(d),info['returned'],info['api_success'],flush=True)
+              d+=timedelta(days=1)
+            finally:await browser.close()
+          try:asyncio.run(collect())
+          except Exception as exc:errors.append({'fatal':repr(exc),'traceback':traceback.format_exc()})
+          rows=[]; invalid=[]
+          for e in records.values():
+           try:
+            t=datetime.fromisoformat(e['date'].replace('Z','+00:00')).astimezone(MSK)
+            if not START<=t.date()<=END:continue
+            periods=e['scores']['periods'];sets=[]
+            for i in (1,2,3):
+             v=periods.get('p'+str(i)) or periods.get('period'+str(i))
+             if not isinstance(v,dict):raise ValueError('missing set '+str(i))
+             a,b=v['home'],v['away']
+             if type(a)!=int or type(b)!=int:raise ValueError('invalid set '+str(i))
+             sets.append((a,b))
+            odd=int(any((a+b)%2 for a,b in sets))
+            rows.append({'id':e['id'],'date_utc':e['date'],'date_msk':str(t.date()),'time_msk':t.strftime('%H:%M:%S'),'home':e.get('home'),'away':e.get('away'),'set1':f'{sets[0][0]}-{sets[0][1]}','set2':f'{sets[1][0]}-{sets[1][1]}','set3':f'{sets[2][0]}-{sets[2][1]}','odd_in_first_3':odd,'status':e.get('status','')})
+           except Exception as exc:invalid.append({'id':e.get('id'),'date':e.get('date'),'error':str(exc)})
+          rows.sort(key=lambda r:(r['date_msk'],r['time_msk'],str(r['id'])))
+          csvout('all_matches_2026.csv',rows,fields)
+          window=[r for r in rows if '07:00:00'<=r['time_msk']<'11:00:00']
+          csvout('matches_07_11_msk.csv',window,fields)
+          summary=[];monthly=[]
+          for info in days:
+           d=info['date'];rr=[r for r in rows if r['date_msk']==d];ww=[r for r in window if r['date_msk']==d]
+           summary.append({'date':d,'api_success':info['api_success'],'api_returned':info['returned'],'all_matches':len(rr),'all_odd':sum(r['odd_in_first_3'] for r in rr),'all_even':sum(1-r['odd_in_first_3'] for r in rr),'window_matches':len(ww),'window_odd':sum(r['odd_in_first_3'] for r in ww),'window_even':sum(1-r['odd_in_first_3'] for r in ww)})
+          csvout('daily_summary.csv',summary,['date','api_success','api_returned','all_matches','all_odd','all_even','window_matches','window_odd','window_even'])
+          for month in sorted(set(x['date'][:7] for x in summary)):
+           rr=[r for r in rows if r['date_msk'].startswith(month)];ww=[r for r in window if r['date_msk'].startswith(month)]; dd=[x for x in summary if x['date'].startswith(month)]
+           monthly.append({'month':month,'days_checked':len(dd),'days_with_api_data':sum(x['api_returned'] is not None and x['api_returned']>0 for x in dd),'days_api_failed':sum(not x['api_success'] for x in dd),'all_matches':len(rr),'all_odd':sum(r['odd_in_first_3'] for r in rr),'all_even':sum(1-r['odd_in_first_3'] for r in rr),'window_matches':len(ww),'window_odd':sum(r['odd_in_first_3'] for r in ww),'window_even':sum(1-r['odd_in_first_3'] for r in ww)})
+          csvout('monthly_summary.csv',monthly,list(monthly[0]) if monthly else ['month'])
+          report={'range':[str(START),str(END)],'league':'Russia - Liga Pro (all divisions)','timezone':'Europe/Moscow','unique_api_events':len(records),'analyzed_matches':len(rows),'odd_matches':sum(r['odd_in_first_3'] for r in rows),'even_matches':sum(1-r['odd_in_first_3'] for r in rows),'window_matches':len(window),'window_odd':sum(r['odd_in_first_3'] for r in window),'window_even':sum(1-r['odd_in_first_3'] for r in window),'invalid_records':invalid,'api_errors':errors,'days':days,'caveat':'API HTTP 200 with 0 results does NOT prove no matches took place; archive may be limited. This reports all retrievable matches, not necessarily all matches played.'}
+          (OUT/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps({k:report[k] for k in ['unique_api_events','analyzed_matches','odd_matches','even_matches','window_matches','window_odd','window_even']},ensure_ascii=False))
+          PYCODE
+          python /tmp/oddshub_full_year_runner.py
+      - name: Upload CSV and report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oddshub-2026-all-available-analysis
+          path: output/
+          retention-days: 30
