@@ -1,0 +1,84 @@
+name: Audit OddsHub match dates
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install browser
+        run: |
+          pip install -q playwright beautifulsoup4
+          python -m playwright install chromium
+      - name: Inspect individual match pages
+        run: |
+          mkdir -p output
+          cat > /tmp/audit.py <<'PY'
+          import asyncio, csv, json, re
+          from pathlib import Path
+          from bs4 import BeautifulSoup
+          from playwright.async_api import async_playwright
+          BASE='https://www.oddshub.io'
+          OUT=Path('output')
+          # Read fresh listings for two distinct date ranges. Never assign dates from a group heading to a match as ground truth.
+          PERIODS=[('2026-10-22','2026-10-22'),('2026-11-07','2026-11-07')]
+          def listing(html):
+              soup=BeautifulSoup(html,'html.parser')
+              items=[]
+              for a in soup.select('a[href*="/closing-odds"]'):
+                  href=a.get('href','')
+                  if not re.search(r'/\d+/closing-odds',href):continue
+                  card=a.find_parent('div',class_=lambda c: c and 'group' in c.split())
+                  tm=card.find('span',string=re.compile(r'^\d{1,2}:\d{2}$')) if card else None
+                  scores=re.findall(r'\b\d{1,2}-\d{1,2}\b',a.get_text(' ',strip=True))
+                  if len(scores)<3:continue
+                  items.append({'href':href,'time_displayed':tm.get_text(strip=True) if tm else '', 'scores':scores[:5], 'label':a.get('aria-label','')})
+              return list({x['href']:x for x in items}.values())
+          async def main():
+              results={'listings':[], 'details':[]}
+              async with async_playwright() as p:
+                  browser=await p.chromium.launch()
+                  page=await browser.new_page(timezone_id='Europe/Moscow')
+                  for start,end in PERIODS:
+                      url=f'{BASE}/table-tennis/russia-liga-pro/results?from={start}&to={end}'
+                      try:
+                          response=await page.goto(url,wait_until='domcontentloaded',timeout=45000)
+                          await page.wait_for_timeout(1800)
+                          html=await page.content()
+                          entries=listing(html)
+                          (OUT/f'listing_{start}.html').write_text(html,encoding='utf-8')
+                          results['listings'].append({'date':start,'http':response.status if response else None,'count':len(entries),'sample':entries[:15], 'no_matches':'No matches finished in this period' in html})
+                          for entry in entries[:6]:
+                              if any(x['href']==entry['href'] for x in results['details']):continue
+                              dpage=await browser.new_page(timezone_id='Europe/Moscow')
+                              try:
+                                  resp=await dpage.goto(BASE+entry['href'],wait_until='domcontentloaded',timeout=35000)
+                                  await dpage.wait_for_timeout(900)
+                                  detail=await dpage.content()
+                                  soup=BeautifulSoup(detail,'html.parser')
+                                  texts=[{'type':tag.get('type'),'text':tag.get_text()[:6000]} for tag in soup.select('script[type="application/ld+json"]')]
+                                  iso_dates=list(dict.fromkeys(re.findall(r'20\d{2}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?',detail)))[:30]
+                                  # Save exact HTML for manual validation; do not infer the match date from unrelated timestamps.
+                                  id=re.search(r'/(\d+)/closing-odds',entry['href']).group(1)
+                                  (OUT/f'match_{id}.html').write_text(detail,encoding='utf-8')
+                                  results['details'].append({**entry,'http':resp.status if resp else None,'listing_date':start,'iso_date_candidates':iso_dates,'jsonld':texts})
+                              except Exception as e:results['details'].append({**entry,'listing_date':start,'error':str(e)[:200]})
+                              finally:await dpage.close()
+                      except Exception as e:results['listings'].append({'date':start,'error':str(e)[:200]})
+                  await browser.close()
+              (OUT/'audit.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+              for r in results['listings']:print('LISTING',r['date'],'HTTP',r.get('http'),'MATCHES',r.get('count'),'ERROR',r.get('error',''))
+              for r in results['details']:print('DETAIL',r['href'],'HTTP',r.get('http'),'DATES',r.get('iso_date_candidates',[])[:8])
+          asyncio.run(main())
+          PY
+          python /tmp/audit.py
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oddshub-date-audit
+          path: output/
+          retention-days: 7
+          if-no-files-found: warn
