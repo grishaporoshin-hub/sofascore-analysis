@@ -1,0 +1,82 @@
+name: OddsHub historical API probe
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Date YYYY-MM-DD'
+        required: true
+        default: '2026-11-01'
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install browser
+        run: |
+          python -m pip install playwright
+          python -m playwright install chromium
+      - name: Probe historical events API
+        env:
+          TARGET_DATE: ${{ inputs.date }}
+        run: |
+          mkdir -p output
+          cat > /tmp/oddshub_api_probe_runner.py <<'PY'
+          import asyncio, json, os, traceback
+          from datetime import date, datetime, timedelta, timezone
+          from pathlib import Path
+          from urllib.parse import urlencode
+          from playwright.async_api import async_playwright
+
+          out=Path('output')
+          target=date.fromisoformat(os.environ['TARGET_DATE'])
+          if target.year != 2026:
+              raise ValueError('Date must be in 2026')
+          # Query adjacent UTC days as well, so a timezone shift cannot silently lose matches.
+          start=datetime.combine(target-timedelta(days=1),datetime.min.time(),tzinfo=timezone.utc)
+          end=datetime.combine(target+timedelta(days=2),datetime.min.time(),tzinfo=timezone.utc)-timedelta(seconds=1)
+          query=urlencode({'from':start.strftime('%Y-%m-%dT%H:%M:%SZ'),'to':end.strftime('%Y-%m-%dT%H:%M:%SZ')})
+          endpoint='https://www.oddshub.io/api/historical/events/table-tennis/russia-liga-pro?'+query
+          report={'requested_date':str(target),'api_url':endpoint}
+          async def main():
+              async with async_playwright() as p:
+                  browser=await p.chromium.launch()
+                  page=await browser.new_page(timezone_id='Europe/Moscow',locale='en-US')
+                  try:
+                      await page.goto('https://www.oddshub.io/table-tennis/russia-liga-pro/results',wait_until='domcontentloaded',timeout=60000)
+                      response=await page.request.get(endpoint,timeout=60000)
+                      report['status']=response.status
+                      report['content_type']=response.headers.get('content-type','')
+                      body=await response.body()
+                      report['bytes']=len(body)
+                      (out/'historical_events_raw.txt').write_bytes(body)
+                      try:
+                          data=json.loads(body)
+                          report['root_type']=type(data).__name__
+                          if isinstance(data,dict):
+                              report['root_keys']=list(data.keys())
+                              report['root_shapes']={k:({'type':type(v).__name__,'length':len(v) if isinstance(v,(list,dict)) else None,'first_item_keys':list(v[0].keys()) if isinstance(v,list) and v and isinstance(v[0],dict) else None}) for k,v in data.items()}
+                          elif isinstance(data,list):
+                              report['count']=len(data)
+                              report['first_item_keys']=list(data[0].keys()) if data and isinstance(data[0],dict) else None
+                          (out/'historical_events.json').write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+                      except Exception as e:
+                          report['json_error']=str(e)
+                  except Exception as e:
+                      report['error']=repr(e)
+                      report['traceback']=traceback.format_exc()[-4000:]
+                  finally:
+                      await browser.close()
+                      (out/'api_report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+                      print(json.dumps(report,ensure_ascii=False,indent=2),flush=True)
+          asyncio.run(main())
+          PY
+          python /tmp/oddshub_api_probe_runner.py
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oddshub-api-probe-${{ inputs.date }}
+          path: output/
+          retention-days: 14
