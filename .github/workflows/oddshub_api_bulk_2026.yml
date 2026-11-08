@@ -1,0 +1,146 @@
+name: OddsHub API bulk 2026 Moscow time
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'First Moscow date (YYYY-MM-DD)'
+        required: true
+        default: '2026-10-01'
+      end_date:
+        description: 'Last Moscow date (YYYY-MM-DD), inclusive, max 31 days'
+        required: true
+        default: '2026-10-31'
+permissions:
+  contents: read
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Install Playwright Chromium
+        run: |
+          python -m pip install playwright
+          python -m playwright install chromium
+      - name: Fetch historical matches and calculate first three sets
+        env:
+          START_DATE: ${{ inputs.start_date }}
+          END_DATE: ${{ inputs.end_date }}
+        run: |
+          mkdir -p output
+          cat > /tmp/oddshub_api_bulk_runner.py <<'PY'
+          import asyncio, csv, json, os, traceback
+          from collections import Counter
+          from datetime import date, datetime, timedelta, timezone
+          from pathlib import Path
+          from urllib.parse import urlencode
+          from zoneinfo import ZoneInfo
+          from playwright.async_api import async_playwright
+
+          OUT=Path('output')
+          START=date.fromisoformat(os.environ['START_DATE'])
+          END=date.fromisoformat(os.environ['END_DATE'])
+          if START.year != 2026 or END.year != 2026 or END < START or (END-START).days > 30:
+              raise ValueError('Select 1-31 days within 2026')
+          MSK=ZoneInfo('Europe/Moscow')
+          fields=['id','date_utc','date_msk','time_msk','home','away','set1','set2','set3','odd_in_first_3','league','status']
+          records={}
+          report={'start_date':str(START),'end_date':str(END),'timezone':'Europe/Moscow',
+                  'scope_warning':'OddsHub API is Russia - Liga Pro overall; A4 Moscow is NOT independently verified.',
+                  'days':[], 'errors':[]}
+          def write_csv(path,rows,cols):
+              with path.open('w',newline='',encoding='utf-8-sig') as f:
+                  w=csv.DictWriter(f,fieldnames=cols,extrasaction='ignore');w.writeheader();w.writerows(rows)
+          async def main():
+              async with async_playwright() as p:
+                  browser=await p.chromium.launch()
+                  page=await browser.new_page(timezone_id='Europe/Moscow')
+                  try:
+                      await page.goto('https://www.oddshub.io/table-tennis/russia-liga-pro/results',wait_until='domcontentloaded',timeout=60000)
+                      d=START
+                      while d<=END:
+                          # 07:00-11:00 Moscow = 04:00-08:00 UTC. Fetch full UTC day for safety.
+                          utc_start=datetime.combine(d,datetime.min.time(),tzinfo=MSK).astimezone(timezone.utc)
+                          utc_end=datetime.combine(d+timedelta(days=1),datetime.min.time(),tzinfo=MSK).astimezone(timezone.utc)
+                          query=urlencode({'from':utc_start.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                                           'to':(utc_end-timedelta(seconds=1)).strftime('%Y-%m-%dT%H:%M:%SZ')})
+                          url='https://www.oddshub.io/api/historical/events/table-tennis/russia-liga-pro?'+query
+                          day={'date':str(d),'url':url,'complete':False}
+                          try:
+                              for attempt in range(3):
+                                  try:
+                                      response=await page.request.get(url,timeout=60000)
+                                      if response.status!=200:raise RuntimeError(f'HTTP {response.status}')
+                                      data=await response.json()
+                                      if not isinstance(data,list):raise ValueError('Unexpected API payload')
+                                      day['returned']=len(data)
+                                      day['complete']=True
+                                      for e in data:
+                                          if isinstance(e,dict) and e.get('id') is not None:
+                                              records[str(e['id'])]=e
+                                      break
+                                  except Exception:
+                                      if attempt==2:raise
+                                      await asyncio.sleep(2*(attempt+1))
+                          except Exception as exc:
+                              day['error']=repr(exc)
+                              report['errors'].append({'date':str(d),'error':repr(exc)})
+                          report['days'].append(day)
+                          print(json.dumps(day,ensure_ascii=False),flush=True)
+                          d+=timedelta(days=1)
+                  except Exception as exc:
+                      report['errors'].append({'setup_error':repr(exc),'traceback':traceback.format_exc()[-3000:]})
+                  finally:
+                      await browser.close()
+          try:
+              asyncio.run(main())
+          except Exception as exc:
+              report['errors'].append({'fatal':repr(exc),'traceback':traceback.format_exc()[-3000:]})
+          rows=[]; bad=[]
+          for e in records.values():
+              try:
+                  t=datetime.fromisoformat(e['date'].replace('Z','+00:00')).astimezone(MSK)
+                  if not(START<=t.date()<=END and 7<=t.hour<11):continue
+                  periods=e['scores']['periods']
+                  scores=[]
+                  for i in range(1,4):
+                      v=periods.get('p'+str(i)) or periods.get('period'+str(i))
+                      if not isinstance(v,dict):raise ValueError('Missing set')
+                      a,b=v['home'],v['away']
+                      if not isinstance(a,int) or not isinstance(b,int):raise ValueError('Invalid score')
+                      scores.append((a,b))
+                  odd=any((a+b)%2 for a,b in scores)
+                  rows.append({'id':e['id'],'date_utc':e['date'],'date_msk':t.date().isoformat(),
+                               'time_msk':t.strftime('%H:%M:%S'),'home':e.get('home'),
+                               'away':e.get('away'),'set1':f'{scores[0][0]}-{scores[0][1]}',
+                               'set2':f'{scores[1][0]}-{scores[1][1]}',
+                               'set3':f'{scores[2][0]}-{scores[2][1]}',
+                               'odd_in_first_3':int(odd),'league':e.get('league',{}).get('name',''),
+                               'status':e.get('status','')})
+              except Exception as exc:bad.append({'id':e.get('id'),'error':str(exc)})
+          rows.sort(key=lambda x:(x['date_msk'],x['time_msk'],str(x['id'])))
+          write_csv(OUT/'matches_07_11_msk.csv',rows,fields)
+          days=[]
+          d=START
+          while d<=END:
+              dayrows=[r for r in rows if r['date_msk']==str(d)]
+              api_day=next((x for x in report['days'] if x['date']==str(d)),{})
+              days.append({'date':str(d),'api_complete':api_day.get('complete',False),
+                           'matches':len(dayrows),'at_least_one_odd':sum(r['odd_in_first_3'] for r in dayrows),
+                           'all_three_even':sum(not r['odd_in_first_3'] for r in dayrows)})
+              d+=timedelta(days=1)
+          write_csv(OUT/'daily_summary.csv',days,['date','api_complete','matches','at_least_one_odd','all_three_even'])
+          report.update({'unique_api_events':len(records),'window_matches':len(rows),
+                         'at_least_one_odd':sum(r['odd_in_first_3'] for r in rows),
+                         'all_three_even':sum(not r['odd_in_first_3'] for r in rows),
+                         'invalid_window_records':bad,'all_days_api_success':all(x.get('complete') for x in report['days']) and len(report['days'])==(END-START).days+1})
+          (OUT/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps({k:report[k] for k in ['unique_api_events','window_matches','at_least_one_odd','all_three_even','all_days_api_success']},ensure_ascii=False),flush=True)
+          PY
+          python /tmp/oddshub_api_bulk_runner.py
+      - name: Upload results and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oddshub-api-bulk-${{ inputs.start_date }}-${{ inputs.end_date }}
+          path: output/
+          retention-days: 30
