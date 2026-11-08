@@ -1,0 +1,37 @@
+name: Test ScanGoal access
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check ScanGoal pages
+        shell: bash
+        run: |
+          python - <<'PY'
+          import urllib.request, urllib.error, re
+          urls = [
+              ('League page', 'https://scangoal.ru/table-tennis/league/rossiya-liga-pro-a4-moskva-55117'),
+              ('November 1 results', 'https://scangoal.ru/table-tennis?d=2026-11-01&sgc=1'),
+          ]
+          for label, url in urls:
+              print('\n---', label, '---', flush=True)
+              try:
+                  request = urllib.request.Request(url, headers={
+                      'User-Agent': 'Mozilla/5.0',
+                      'Accept': 'text/html,application/xhtml+xml',
+                  })
+                  with urllib.request.urlopen(request, timeout=25) as response:
+                      html = response.read(2_000_000).decode('utf-8', errors='replace')
+                      print('HTTP:', response.status)
+                      print('Bytes:', len(html.encode('utf-8')))
+                      print('Contains Liga Pro A4:', bool(re.search(r'Лига\s*Про\s*А4', html, re.I)))
+                      print('Contains November 1:', '01.11' in html or '2026-11-01' in html)
+                      print('Contains results heading:', 'Результаты' in html)
+                      print('Page title:', (re.search(r'<title[^>]*>(.*?)</title>', html, re.I | re.S).group(1).strip()[:160] if re.search(r'<title[^>]*>(.*?)</title>', html, re.I | re.S) else 'not found'))
+              except urllib.error.HTTPError as e:
+                  print('HTTP error:', e.code)
+              except Exception as e:
+                  print('Request error:', type(e).__name__, str(e))
+          PY
