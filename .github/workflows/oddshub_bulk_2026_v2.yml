@@ -1,0 +1,152 @@
+name: OddsHub 2026 bulk daily collector v2
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'First date YYYY-MM-DD (inclusive)'
+        required: true
+        default: '2026-11-01'
+      end_date:
+        description: 'Last date YYYY-MM-DD (inclusive, max 31 days per run)'
+        required: true
+        default: '2026-11-30'
+permissions:
+  contents: read
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Install dependencies
+        run: |
+          python -m pip install playwright beautifulsoup4
+          python -m playwright install chromium
+      - name: Collect daily pages
+        env:
+          START_DATE: ${{ inputs.start_date }}
+          END_DATE: ${{ inputs.end_date }}
+        run: |
+          mkdir -p output
+          cat > /tmp/oddshub_bulk_collector.py <<'PYCODE'
+          import asyncio,csv,json,os,re,traceback
+          from collections import Counter
+          from datetime import date,datetime,timedelta
+          from pathlib import Path
+          from urllib.parse import urlencode
+          from bs4 import BeautifulSoup
+          from playwright.async_api import async_playwright
+
+          OUT=Path('output'); BASE='https://www.oddshub.io/table-tennis/russia-liga-pro/results'
+          DAY=re.compile(r'^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}$')
+          SCORE=re.compile(r'^\d{1,2}-\d{1,2}$'); TIME=re.compile(r'^\d{1,2}:\d{2}$'); MORE=re.compile(r'^Show\s+\d+\s+more$',re.I)
+          COLUMNS=['requested_date','displayed_date','date_2026','displayed_time','player1','player2','set_scores','set_count','first_three_parity','in_target_window','aria_label']
+          def extract(html):
+              soup=BeautifulSoup(html,'html.parser'); current=None; rows=[]; headings=[]
+              for el in soup.select('h2, button[aria-label]'):
+                  if el.name=='h2':
+                      s=el.get_text(' ',strip=True)
+                      if DAY.fullmatch(s): current=s;headings.append(s)
+                  elif 'Closing odds.' in (el.get('aria-label') or ''):
+                      parent=el.parent;first=parent.select_one('span') if parent else None
+                      tm=first.get_text(' ',strip=True) if first else ''
+                      if not TIME.fullmatch(tm):tm=''
+                      spans=el.select('span')
+                      scores=[x.get_text(' ',strip=True) for x in spans if SCORE.fullmatch(x.get_text(' ',strip=True))]
+                      names=[x.get_text(' ',strip=True) for x in spans if 'font-medium' in (x.get('class') or [])]
+                      rows.append(dict(displayed_date=current or '',displayed_time=tm,player1=names[0] if names else '',player2=names[1] if len(names)>1 else '',set_scores='|'.join(scores),set_count=len(scores),aria_label=el.get('aria-label','')))
+              return rows,headings
+          def enrich(r,requested):
+              r['requested_date']=requested;r['date_2026']=''
+              try:r['date_2026']=datetime.strptime(r['displayed_date']+' 2026','%A, %b %d %Y').strftime('%Y-%m-%d')
+              except ValueError:pass
+              scores=r['set_scores'].split('|') if r['set_scores'] else []
+              r['first_three_parity']='incomplete'
+              if len(scores)>=3:
+                  r['first_three_parity']='odd_present' if any(sum(map(int,x.split('-')))%2 for x in scores[:3]) else 'all_even'
+              r['in_target_window']='yes' if r['date_2026']==requested and '07:00'<=r['displayed_time']<'11:00' else 'no'
+              return r
+          def write_csv(path,rows):
+              with path.open('w',newline='',encoding='utf-8-sig') as f:
+                  w=csv.DictWriter(f,fieldnames=COLUMNS,extrasaction='ignore');w.writeheader();w.writerows(rows)
+          async def collect_day(browser,d):
+              day=d.isoformat(); report=dict(requested_date=day,status='started',pagination=[],timezone='Europe/Moscow')
+              page=await browser.new_page(timezone_id='Europe/Moscow',locale='en-US')
+              try:
+                  url=BASE+'?'+urlencode({'from':day,'to':day})
+                  response=await page.goto(url,wait_until='domcontentloaded',timeout=60000)
+                  report['http']=response.status if response else None
+                  await page.wait_for_timeout(2000)
+                  if response and response.status!=200:raise RuntimeError('HTTP '+str(response.status))
+                  if 'from='+day not in page.url or 'to='+day not in page.url:raise RuntimeError('URL date not retained: '+page.url)
+                  for step in range(100):
+                      rows,_=extract(await page.content());buttons=page.get_by_role('button',name=MORE)
+                      labels=await buttons.all_text_contents() if await buttons.count() else []
+                      report['pagination'].append(dict(step=step,rows=len(rows),buttons=labels[:3]))
+                      if not labels:break
+                      before=len(rows)
+                      advanced=False
+                      for attempt in range(4):
+                          try:
+                              button=page.get_by_role('button',name=MORE).first
+                              await button.scroll_into_view_if_needed(timeout=10000)
+                              await button.click(timeout=15000)
+                              for wait in range(8):
+                                  await page.wait_for_timeout(750)
+                                  newrows,_=extract(await page.content())
+                                  if len(newrows)>before:
+                                      advanced=True
+                                      break
+                              if advanced:break
+                          except Exception as e:
+                              report.setdefault('click_errors',[]).append(str(e)[:180])
+                          await page.wait_for_timeout(1500)
+                      if not advanced:
+                          report['pagination_warning']='Load more did not increase rows after retries'
+                          break
+                  else:report['pagination_warning']='Pagination iteration limit'
+                  rows,headings=extract(await page.content())
+                  # Preserve repeated-looking matches: same players/time/scores may be distinct games.
+                  enriched=[enrich(r,day) for r in rows]
+                  write_csv(OUT/f'day_{day}.csv',enriched)
+                  target=[r for r in enriched if r['in_target_window']=='yes' and r['first_three_parity']!='incomplete']
+                  report.update(status='ok' if not report.get('pagination_warning') else 'partial',raw_rows=len(rows),headings=headings,
+                      dates=dict(Counter(r['date_2026'] for r in enriched)),target_count=len(target),odd_present=sum(r['first_three_parity']=='odd_present' for r in target),all_even=sum(r['first_three_parity']=='all_even' for r in target),incomplete=sum(r['in_target_window']=='yes' and r['first_three_parity']=='incomplete' for r in enriched))
+                  if not rows:report['status']='empty_unverified'
+                  return report,enriched
+              except Exception as exc:
+                  report.update(status='error',error=repr(exc),traceback=traceback.format_exc()[-2500:])
+                  try:(OUT/f'error_{day}.html').write_text(await page.content(),encoding='utf-8')
+                  except Exception:pass
+                  return report,[]
+              finally:await page.close()
+          async def main():
+              start=date.fromisoformat(os.environ['START_DATE']);end=date.fromisoformat(os.environ['END_DATE'])
+              if start.year!=2026 or end.year!=2026 or end<start or (end-start).days>30:raise ValueError('Use a 2026 date range of 1 to 31 days')
+              reports=[];allrows=[]
+              async with async_playwright() as p:
+                  browser=await p.chromium.launch()
+                  for n in range((end-start).days+1):
+                      day=start+timedelta(days=n)
+                      rep,rows=await collect_day(browser,day)
+                      reports.append(rep);allrows.extend(rows)
+                      print(json.dumps({k:v for k,v in rep.items() if k not in ('pagination','traceback')},ensure_ascii=False),flush=True)
+                      (OUT/'daily_report.json').write_text(json.dumps(reports,indent=2,ensure_ascii=False),encoding='utf-8')
+                  await browser.close()
+              # Count only rows whose displayed date matches the requested day.
+              # Do not merge across requested dates: adjacent-date results may overlap.
+              target=[r for r in allrows if r['in_target_window']=='yes' and r['first_three_parity']!='incomplete']
+              write_csv(OUT/'target_matches.csv',target)
+              totals=dict(start_date=start.isoformat(),end_date=end.isoformat(),days_requested=len(reports),days_ok=sum(r['status']=='ok' for r in reports),days_error=sum(r['status']=='error' for r in reports),days_partial=sum(r['status']=='partial' for r in reports),days_empty_unverified=sum(r['status']=='empty_unverified' for r in reports),target_matches=len(target),odd_present=sum(r['first_three_parity']=='odd_present' for r in target),all_even=sum(r['first_three_parity']=='all_even' for r in target),caveat='PROVISIONAL: displayed timezone is not independently verified. The page may include more than Moscow A4. Site coverage is unverified. Do not treat empty/error days as zero matches.')
+              (OUT/'summary.json').write_text(json.dumps(totals,ensure_ascii=False,indent=2),encoding='utf-8')
+              print('SUMMARY',json.dumps(totals,ensure_ascii=False),flush=True)
+          asyncio.run(main())
+          PYCODE
+          python /tmp/oddshub_bulk_collector.py
+      - name: Upload results even if collection fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oddshub-bulk-2026-${{ inputs.start_date }}-${{ inputs.end_date }}
+          path: output/
+          if-no-files-found: warn
+          retention-days: 14
