@@ -1,0 +1,94 @@
+name: Diagnose OddsHub November calendar
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install browser
+        run: |
+          pip install -q playwright beautifulsoup4
+          python -m playwright install chromium
+      - name: Select November 7 via calendar and inspect matches
+        run: |
+          mkdir -p output
+          cat > /tmp/oddshub_diagnostic.py <<'PY'
+          import asyncio,json,re
+          from pathlib import Path
+          from bs4 import BeautifulSoup
+          from playwright.async_api import async_playwright
+          OUT=Path('output')
+          URL='https://www.oddshub.io/table-tennis/russia-liga-pro/results'
+          async def main():
+              report={'target':'2026-11-07','method':'calendar selection; no query-string assumptions'}
+              async with async_playwright() as p:
+                  browser=await p.chromium.launch()
+                  page=await browser.new_page(timezone_id='Europe/Moscow',locale='en-US',viewport={'width':1440,'height':900})
+                  try:
+                      response=await page.goto(URL,wait_until='domcontentloaded',timeout=60000)
+                      report['http']=response.status if response else None
+                      await page.wait_for_timeout(2500)
+                      await page.get_by_role('button',name='Custom range').click(timeout=15000)
+                      await page.wait_for_timeout(500)
+                      date_button=page.get_by_role('button',name=re.compile(r'November 7th, 2026'))
+                      for attempt in range(13):
+                          if await date_button.count(): break
+                          await page.get_by_role('button',name='Go to the Previous Month').click(timeout=8000)
+                          await page.wait_for_timeout(150)
+                      report['date_button_found']=bool(await date_button.count())
+                      if not report['date_button_found']: raise RuntimeError('November 7 date button not found')
+                      await date_button.first.click()
+                      # Select the same date as both endpoints if UI allows; otherwise use Nov 7-8.
+                      apply=page.get_by_role('button',name='Apply')
+                      if not await apply.is_enabled():
+                          eighth=page.get_by_role('button',name=re.compile(r'November 8th, 2026'))
+                          await eighth.first.click()
+                          report['selection']='Nov 7–8 (single-day range unavailable)'
+                      else: report['selection']='Nov 7'
+                      await apply.click(timeout=12000)
+                      await page.wait_for_timeout(3500)
+                      report['url_after_apply']=page.url
+                      report['visible_body_start']=(await page.locator('body').inner_text())[:2500]
+                      await page.screenshot(path=str(OUT/'november_results.png'))
+                      html=await page.content()
+                      (OUT/'november_page.html').write_text(html,encoding='utf-8')
+                      soup=BeautifulSoup(html,'html.parser')
+                      links={}
+                      for a in soup.select('a[href*="/closing-odds"]'):
+                          href=a.get('href','')
+                          m=re.search(r'/([0-9]+)/closing-odds',href)
+                          if m:links[m.group(1)]=href
+                      report['unique_match_links_visible']=len(links)
+                      report['no_matches_message']='No matches finished in this period' in await page.locator('body').inner_text()
+                      report['sample_match_ids']=list(links)[:15]
+                      detail=[]
+                      for mid,href in list(links.items())[:5]:
+                          tab=await page.context.new_page()
+                          try:
+                              r=await tab.goto('https://www.oddshub.io'+href,wait_until='domcontentloaded',timeout=30000)
+                              ds=BeautifulSoup(await tab.content(),'html.parser')
+                              meta=ds.find('meta',attrs={'name':'description'})
+                              detail.append({'id':mid,'http':r.status if r else None,'description':(meta.get('content','') if meta else '')[:350]})
+                          except Exception as e:detail.append({'id':mid,'error':str(e)[:200]})
+                          finally:await tab.close()
+                      report['sample_match_details']=detail
+                  except Exception as e:
+                      report['error']=repr(e)
+                      await page.screenshot(path=str(OUT/'error.png'))
+                  finally:
+                      (OUT/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+                      print(json.dumps({k:v for k,v in report.items() if k!='visible_body_start'},ensure_ascii=False,indent=2))
+                      await browser.close()
+          asyncio.run(main())
+          PY
+          python /tmp/oddshub_diagnostic.py
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oddshub-november-calendar-diagnostics
+          path: output/
+          retention-days: 7
