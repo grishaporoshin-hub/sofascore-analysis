@@ -1,0 +1,115 @@
+name: Verify OddsHub match dates and set parity
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Install dependencies
+        run: |
+          pip install -q playwright beautifulsoup4
+          python -m playwright install chromium
+      - name: Verify dates on individual match pages
+        run: |
+          mkdir -p output
+          cat > /tmp/verify.py <<'PY'
+          import asyncio, csv, json, re
+          from collections import Counter
+          from datetime import datetime
+          from pathlib import Path
+          from bs4 import BeautifulSoup
+          from playwright.async_api import async_playwright
+
+          BASE='https://www.oddshub.io'
+          OUT=Path('output')
+          # Diagnostic dates only. Do not call this a complete yearly archive.
+          DATES=['2026-10-22','2026-11-07']
+          MONTHS={m:i for i,m in enumerate(['January','February','March','April','May','June','July','August','September','October','November','December'],1)}
+          def extract_listing(html):
+              soup=BeautifulSoup(html,'html.parser')
+              items={}
+              for a in soup.select('a[href*="/closing-odds"]'):
+                  href=a.get('href','')
+                  match=re.search(r'/([0-9]+)/closing-odds',href)
+                  if not match: continue
+                  card=a.find_parent('div',class_=lambda c: bool(c) and 'group' in c.split())
+                  tm=card.find('span',string=re.compile(r'^\d{1,2}:\d{2}$')) if card else None
+                  scores=re.findall(r'(?<!\d)(\d{1,2})\s*[-:]\s*(\d{1,2})(?!\d)',a.get_text(' ',strip=True))
+                  if len(scores)<3: continue
+                  items[match.group(1)]={'id':match.group(1),'href':href,'time':tm.get_text(strip=True) if tm else '', 'scores':scores[:5]}
+              return list(items.values())
+          def detail_date(html):
+              soup=BeautifulSoup(html,'html.parser')
+              meta=soup.find('meta',attrs={'name':'description'})
+              desc=meta.get('content','') if meta else ''
+              m=re.search(r'\b(\d{1,2})\s+('+'|'.join(MONTHS)+r')\s+(20\d{2})\b',desc,re.I)
+              if not m:return None,desc
+              return f'{int(m.group(3)):04d}-{MONTHS[m.group(2).title()]:02d}-{int(m.group(1)):02d}',desc
+          async def main():
+              records=[]; audits=[]; conflicts=[]
+              async with async_playwright() as p:
+                  browser=await p.chromium.launch()
+                  context=await browser.new_context(timezone_id='Europe/Moscow',locale='en-US')
+                  page=await context.new_page()
+                  seen={}
+                  for selected in DATES:
+                      url=f'{BASE}/table-tennis/russia-liga-pro/results?from={selected}&to={selected}'
+                      try:
+                          resp=await page.goto(url,wait_until='domcontentloaded',timeout=45000)
+                          await page.wait_for_timeout(2200)
+                          entries=extract_listing(await page.content())
+                          audits.append({'selected_date':selected,'http':resp.status if resp else None,'listing_entries':len(entries)})
+                          print('LISTING',selected,'entries',len(entries))
+                      except Exception as exc:
+                          audits.append({'selected_date':selected,'error':str(exc)[:300]});continue
+                      for idx,item in enumerate(entries):
+                          mid=item['id']
+                          if mid in seen:
+                              if seen[mid]['scores']!=item['scores'] or seen[mid]['time']!=item['time']:
+                                  conflicts.append({'id':mid,'issue':'listing fields differ across pages','selected_date':selected})
+                              continue
+                          seen[mid]=item
+                          dpage=await context.new_page()
+                          try:
+                              r=await dpage.goto(BASE+item['href'],wait_until='domcontentloaded',timeout=30000)
+                              html=await dpage.content()
+                              actual,desc=detail_date(html)
+                              status=r.status if r else None
+                              if not actual:
+                                  conflicts.append({'id':mid,'issue':'date missing from match description','selected_date':selected,'http':status})
+                              elif not item['time']:
+                                  conflicts.append({'id':mid,'issue':'time missing from listing','selected_date':selected,'actual_date':actual})
+                              else:
+                                  first=item['scores'][:3]
+                                  odd=any((int(a)+int(b))%2 for a,b in first)
+                                  records.append({'match_id':mid,'match_date_from_detail':actual,'time_displayed':item['time'],'date_requested':selected,'set1':'-'.join(first[0]),'set2':'-'.join(first[1]),'set3':'-'.join(first[2]),'classification':'at_least_one_odd' if odd else 'all_three_even','url':BASE+item['href']})
+                          except Exception as exc:
+                              conflicts.append({'id':mid,'issue':str(exc)[:250],'selected_date':selected})
+                          finally:await dpage.close()
+                          if idx%20==0:print('VERIFIED',selected,idx+1,'/',len(entries))
+                  await browser.close()
+              # Only trust match page date. Time is still the listing's displayed time, so label provisional.
+              filtered=[r for r in records if '07:00'<=r['time_displayed']<='11:00']
+              counts=Counter(r['classification'] for r in filtered)
+              def write_csv(filename,rows,fields):
+                  with (OUT/filename).open('w',newline='',encoding='utf-8-sig') as f:
+                      w=csv.DictWriter(f,fieldnames=fields,extrasaction='ignore');w.writeheader();w.writerows(rows)
+              fields=['match_id','match_date_from_detail','time_displayed','date_requested','set1','set2','set3','classification','url']
+              write_csv('verified_matches_all_times.csv',records,fields)
+              write_csv('verified_matches_07_11_provisional.csv',filtered,fields)
+              (OUT/'report.json').write_text(json.dumps({'scope':'Diagnostic only: two requested listing dates; NOT complete year or month','time_note':'Time from listing; independent UTC/Moscow validation still required','listings':audits,'unique_ids_seen':len(seen),'verified_detail_dates':len(records),'filtered_07_11':len(filtered),'at_least_one_odd':counts['at_least_one_odd'],'all_three_even':counts['all_three_even'],'conflicts':conflicts[:1000]},ensure_ascii=False,indent=2),encoding='utf-8')
+              print('REPORT unique_ids',len(seen),'verified_dates',len(records),'07_11',len(filtered),'odd',counts['at_least_one_odd'],'all_even',counts['all_three_even'],'conflicts',len(conflicts))
+          asyncio.run(main())
+          PY
+          python /tmp/verify.py
+      - name: Upload verification results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oddshub-verified-dates
+          path: output/
+          retention-days: 7
+          if-no-files-found: warn
