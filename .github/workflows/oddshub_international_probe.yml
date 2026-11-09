@@ -1,0 +1,113 @@
+name: OddsHub international table tennis API probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install Playwright
+        run: |
+          python -m pip install playwright
+          python -m playwright install chromium
+      - name: Probe tournament API and analyze available matches
+        run: |
+          mkdir -p output
+          cat > /tmp/international_probe_runner.py <<'PY'
+          import asyncio,csv,json,traceback
+          from datetime import datetime,timezone,timedelta
+          from pathlib import Path
+          from collections import Counter
+          from urllib.parse import urlencode
+          from zoneinfo import ZoneInfo
+          from playwright.async_api import async_playwright
+          OUT=Path('output'); MSK=ZoneInfo('Europe/Moscow')
+          # Slugs are candidates; each is independently checked, never assumed valid.
+          candidates=['czechia-czech-liga-pro','international-tt-cup','international-tt-elite-series','ukraine-setka-cup','belarus-liga-pro']
+          # Check a recent seven-day range to validate API schema and discover which tournaments have data.
+          start=datetime(2026,11,1,tzinfo=timezone.utc)
+          end=datetime(2026,11,9,tzinfo=timezone.utc)
+          report={'scope':'API feasibility probe, not complete 2026 archive','date_range_utc':'2026-11-01 through 2026-11-08','tournaments':[]}
+          fields=['tournament','id','utc','msk','home','away','set1','set2','set3','odd1','odd2','odd3','at_least_one_even','all_three_odd']
+          rows=[]
+          async def main():
+            async with async_playwright() as p:
+              browser=await p.chromium.launch()
+              context=await browser.new_context()
+              page=await context.new_page()
+              for slug in candidates:
+                item={'slug':slug,'status':'unverified','api_status':None,'returned':0,'valid':0,'errors':[]}
+                try:
+                  page_url=f'https://www.oddshub.io/table-tennis/{slug}/results'
+                  resp=await page.goto(page_url,wait_until='domcontentloaded',timeout=45000)
+                  item['page_status']=resp.status if resp else None
+                  query=urlencode({'from':start.strftime('%Y-%m-%dT%H:%M:%SZ'),'to':(end-timedelta(seconds=1)).strftime('%Y-%m-%dT%H:%M:%SZ')})
+                  api=f'https://www.oddshub.io/api/historical/events/table-tennis/{slug}?{query}'
+                  response=await context.request.get(api,timeout=60000)
+                  item['api_status']=response.status
+                  body=await response.text()
+                  (OUT/f'{slug}_response_excerpt.txt').write_text(body[:15000],encoding='utf-8')
+                  if response.status!=200: raise ValueError('API returned non-200')
+                  data=json.loads(body)
+                  if not isinstance(data,list):raise ValueError('API returned non-list JSON')
+                  item['returned']=len(data)
+                  seen=set()
+                  for e in data:
+                    try:
+                      if not isinstance(e,dict):continue
+                      eid=str(e['id'])
+                      if eid in seen:continue
+                      seen.add(eid)
+                      dt=datetime.fromisoformat(e['date'].replace('Z','+00:00'))
+                      if not start<=dt<end:continue
+                      periods=e['scores']['periods']
+                      scores=[]
+                      for i in range(1,4):
+                        s=periods.get('p'+str(i)) or periods.get('period'+str(i))
+                        if not isinstance(s,dict):raise ValueError('Missing set')
+                        a,b=s['home'],s['away']
+                        if not isinstance(a,int) or not isinstance(b,int):raise ValueError('Invalid set')
+                        scores.append((a,b))
+                      parity=[(a+b)%2 for a,b in scores]
+                      rows.append({'tournament':slug,'id':eid,'utc':dt.isoformat(),'msk':dt.astimezone(MSK).isoformat(),
+                                   'home':str(e.get('home','')),'away':str(e.get('away','')),
+                                   **{f'set{i+1}':f'{a}-{b}' for i,(a,b) in enumerate(scores)},
+                                   **{f'odd{i+1}':parity[i] for i in range(3)},
+                                   'at_least_one_even':int(not all(parity)), 'all_three_odd':int(all(parity))})
+                      item['valid']+=1
+                    except Exception as ex:
+                      item['invalid_count']=item.get('invalid_count',0)+1
+                  item['status']='ok' if item['valid'] else 'empty_or_no_valid_sets'
+                except Exception as ex:
+                  item['errors'].append(repr(ex))
+                report['tournaments'].append(item)
+                print(json.dumps(item,ensure_ascii=False),flush=True)
+              await browser.close()
+          try:asyncio.run(main())
+          except Exception as ex:report['fatal']=repr(ex);report['traceback']=traceback.format_exc()
+          with (OUT/'matches.csv').open('w',newline='',encoding='utf-8-sig') as f:
+            w=csv.DictWriter(f,fieldnames=fields);w.writeheader();w.writerows(rows)
+          summaries=[]
+          for item in report['tournaments']:
+            for window in ['all','07_11_msk']:
+              rr=[r for r in rows if r['tournament']==item['slug'] and (window=='all' or 7<=int(r['msk'][11:13])<11)]
+              n=len(rr);odd=[sum(r[f'odd{i}'] for r in rr) for i in (1,2,3)]
+              summaries.append({'tournament':item['slug'],'window':window,'matches':n,
+                                'odd_set1':odd[0],'odd_set2':odd[1],'odd_set3':odd[2],
+                                'at_least_one_even':sum(r['at_least_one_even'] for r in rr),
+                                'all_three_odd':sum(r['all_three_odd'] for r in rr),
+                                'first_set_odd_roi_at_2_5':round(2.5*odd[0]/n-1,5) if n else ''})
+          with (OUT/'summary.csv').open('w',newline='',encoding='utf-8-sig') as f:
+            w=csv.DictWriter(f,fieldnames=list(summaries[0]));w.writeheader();w.writerows(summaries)
+          (OUT/'report.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+          python /tmp/international_probe_runner.py
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oddshub-international-probe
+          path: output/
+          retention-days: 30
