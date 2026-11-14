@@ -1,0 +1,62 @@
+name: Check Liga Pro results source
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install browser
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+      - name: Check AISports page
+        run: |
+          mkdir -p output
+          cat > /tmp/check.py <<'PY'
+          import asyncio, json, re
+          from pathlib import Path
+          from playwright.async_api import async_playwright
+          
+          OUT=Path("output")
+          OUT.mkdir(exist_ok=True)
+          URL="https://aisports.ru/league/table_tennis/russia-liga-pro/schedule"
+          
+          async def main():
+              async with async_playwright() as pw:
+                  browser=await pw.chromium.launch(headless=True)
+                  page=await browser.new_page(viewport={"width":1440,"height":1000},locale="ru-RU",timezone_id="Europe/Moscow")
+                  report={"url":URL,"goal":"Verify accessible final scores and date filtering before full extraction"}
+                  try:
+                      response=await page.goto(URL,wait_until="domcontentloaded",timeout=60000)
+                      await page.wait_for_timeout(4500)
+                      report["http_status"]=response.status if response else None
+                      report["final_url"]=page.url
+                      report["title"]=await page.title()
+                      text=await page.locator("body").inner_text(timeout=20000)
+                      report["has_liga_pro"]="Лига Про" in text
+                      report["has_results"]="Результаты" in text
+                      report["has_ft"]=bool(re.search(r"\bFT\b",text))
+                      report["date_inputs"]=await page.locator("input").count()
+                      report["body_preview"]=text[:2500]
+                      (OUT/"page.html").write_text(await page.content(),encoding="utf-8")
+                      (OUT/"page_text.txt").write_text(text,encoding="utf-8")
+                      await page.screenshot(path=str(OUT/"page.png"),full_page=False)
+                  except Exception as e:
+                      report["error"]=str(e)[:700]
+                  await browser.close()
+                  (OUT/"source_check.json").write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding="utf-8")
+                  print(json.dumps(report,ensure_ascii=False,indent=2))
+          
+          asyncio.run(main())
+          PY
+          python /tmp/check.py
+      - name: Upload diagnostic files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: liga-pro-source-check
+          path: output/
+          retention-days: 7
