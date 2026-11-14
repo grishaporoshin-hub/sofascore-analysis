@@ -1,0 +1,101 @@
+name: SofaScore Liga Pro final scores
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Install dependencies
+        run: pip install requests
+      - name: Collect results
+        run: |
+          mkdir -p output
+          cat > /tmp/collect.py <<'PY'
+          import csv, json, time, re
+          from datetime import date, timedelta, datetime, timezone
+          from zoneinfo import ZoneInfo
+          from pathlib import Path
+          import requests
+          
+          OUT=Path("output"); OUT.mkdir(exist_ok=True)
+          START=date(2026,10,1)
+          END=min(date.today(),date(2026,11,30))
+          BASE="https://www.sofascore.com/api/v1"
+          API="https://www.sofascore.com/api/v1"
+          s=requests.Session()
+          s.headers.update({"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36","Accept":"application/json","Referer":"https://www.sofascore.com/"})
+          report={"source":"SofaScore","period":[str(START),str(END)],"days":[],"warning":"Completeness not guaranteed. Check every date and all source responses."}
+          rows={}
+          def get(url):
+              for attempt in range(3):
+                  try:
+                      r=s.get(url,timeout=30)
+                      if r.status_code==200:
+                          return r.json(),None
+                      err=f"HTTP {r.status_code}: {r.text[:90]}"
+                  except Exception as exc: err=str(exc)[:160]
+                  time.sleep(1.5*(attempt+1))
+              return None,err
+          if END<START: raise SystemExit("Dates not started")
+          day=START
+          while day<=END:
+              # SofaScore daily endpoint historically documented; may block automated requests.
+              url=f"{API}/sport/table-tennis/scheduled-events/{day.isoformat()}"
+              payload,error=get(url)
+              dr={"date":str(day),"url":url,"error":error,"events":0,"liga_pro_events":0,"confirmed":0}
+              if isinstance(payload,dict):
+                  events=payload.get("events",[])
+                  dr["events"]=len(events)
+                  for e in events:
+                      tournament=e.get("tournament") or {}
+                      category=tournament.get("category") or {}
+                      name=(tournament.get("name") or "")+" "+((tournament.get("uniqueTournament") or {}).get("name") or "")
+                      cat=(category.get("name") or "").lower()
+                      if not re.search(r"liga[\s-]*pro|лига[\s-]*про",name,re.I):
+                          continue
+                      if any(x in cat for x in ["belarus","czech","беларус","чех"]):
+                          continue
+                      # Require explicit Russian category; no silent inclusion of other countries.
+                      if not ("russia" in cat or "росси" in cat):
+                          continue
+                      dr["liga_pro_events"]+=1
+                      hs=e.get("homeScore") or {}; aw=e.get("awayScore") or {}
+                      h=hs.get("current"); a=aw.get("current")
+                      status=(e.get("status") or {}).get("type")
+                      if status!="finished" or not isinstance(h,int) or not isinstance(a,int) or max(h,a)!=3 or min(h,a)>2:
+                          continue
+                      stamp=e.get("startTimestamp")
+                      if not isinstance(stamp,(int,float)):continue
+                      dt=datetime.fromtimestamp(stamp,timezone.utc).astimezone(ZoneInfo("Europe/Moscow"))
+                      if not START<=dt.date()<=END:continue
+                      eid=e.get("id")
+                      if eid is None:continue
+                      rows[str(eid)]={"id":eid,"date_msk":dt.date().isoformat(),"time_msk":dt.strftime("%H:%M"),
+                          "player1":(e.get("homeTeam") or {}).get("name",""),
+                          "player2":(e.get("awayTeam") or {}).get("name",""),
+                          "final_score":f"{h}:{a}","source_url":f"https://www.sofascore.com/event/{eid}"}
+                      dr["confirmed"]+=1
+              report["days"].append(dr)
+              print(json.dumps(dr,ensure_ascii=False),flush=True)
+              day+=timedelta(days=1)
+              time.sleep(.35)
+          with (OUT/"liga_pro_results.csv").open("w",encoding="utf-8-sig",newline="") as f:
+              fields=["id","date_msk","time_msk","player1","player2","final_score","source_url"]
+              w=csv.DictWriter(f,fieldnames=fields);w.writeheader()
+              w.writerows(sorted(rows.values(),key=lambda x:(x["date_msk"],x["time_msk"],x["id"])))
+          report["confirmed_total"]=len(rows)
+          report["failed_days"]=sum(bool(d["error"]) for d in report["days"])
+          (OUT/"coverage_report.json").write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding="utf-8")
+          print("FINAL",report["confirmed_total"],"FAILED_DAYS",report["failed_days"])
+          PY
+          python /tmp/collect.py
+      - name: Upload files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sofascore-liga-pro-results
+          path: output/
+          retention-days: 14
